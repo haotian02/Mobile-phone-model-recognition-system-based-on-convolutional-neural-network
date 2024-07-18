@@ -34,7 +34,8 @@
 ```plaintext
 .
 ├── checkpoints
-│   ├── Apple.py
+│   ├── Apple.pth
+│   ├── Samsung.pth
 │   ├── ... 
 │   ├── Resnet34-CBAM-fc.pth
 │   ├── Resnet34-CBAM-all.pth
@@ -45,19 +46,37 @@
 ├── train1.py 
 ├── test1.py
 ├── ui.py
-├── 图像爬取.py
 ├── README.md
 └── requirements.txt
 ```
- 环境依赖
+
+## 手机型号
+
+- Apple iPhone 11、Apple iPhone 11 Pro Max、Apple iphone 13、Apple iPhone 14 Pro Max、Apple iPhone 6s plus、Apple iPhone 7 plus、Apple iPhone 8 plus、Apple iPhone SE2、Apple iPhone XR、Apple iPhone XS Max
+- Samsung note10、Samsung note20 ultra、Samsung note8、Samsung Samsung note9、Samsung s10、Samsung s8、Samsung s20、Samsung s20ultra、Samsung s21、Samsung s21 ultra、Samsung s22 ultra
+- vivo s15 pro、vivo s16 pro、vivo x50 pro、vivo x60 pro、vivo x70 pro、vivo x80 pro、vivo x90 pro
+- 一加 10 pro、一加 11、一加 7 pro、一加 8 pro、一加 9 pro、一加 ace 2v、一加 ace pro
+- iqoo 10 pro、iqoo 8 pro、iqoo 9 pro
+- oppo findx2 pro、oppo findx3 pro、oppo findx5 pro、oppo findx6 pro、oppo reno6 pro、oppo reno7 pro、oppo reno8 pro
+- realme 11 pro、realme GT2 pro、realme GTneo3、realme GTneo5、realme Q3 pro
+- 努比亚 z40 pro、努比亚 z40s pro、努比亚 z50 ultra、努比亚 z50s pro
+- 小米 10 pro、小米 11 pro、小米 11 ultra、小米 12 pro、小米 12s ultra、小米 13 pro、小米 13 ultra、小米 6、小米 8、小米 9 pro
+- 华为 mate20 pro、华为 mate30 pro、华为 mate40 pro、华为 mate50 pro、华为 nova10 pro、华为 nova11 pro、华为 nova8 pro、华为 nova9 pro、华为 p20 pro、华为 p30 pro、华为 p40 pro、华为 p50 pro、华为 p60 pro
+- 红米 k20 pro、红米 k30 pro、红米 k40 pro、红米 k50 pro、红米 k60 pro、红米 note12 turbo、红米 note8 pro、红米 note9 pro
+- 荣耀 100 pro、荣耀 50 pro、荣耀 60 pro、荣耀 70 pro、荣耀 80 pro、荣耀 90 pro、荣耀 magic4 pro、荣耀 magic5 pro
+- 魅族 16 plus、魅族 16s pro、魅族 17 pro、魅族 18、魅族 18 pro、魅族 20 pro、魅族 pro7 plus
+
+## 环境依赖
 
 	•	Python 3.x
 	•	PyTorch
 	•	Tkinter
 	•	其他依赖请参见requirements.txt
 
-参考文献
+## 参考文献
 
 	•	A. G. Biney and H. Sellahewa, “Analysis of smartphone model identification using digital images,” presented at the 20th IEEE International Conference on Image Processing, Melbourne, Australia, 2015. 
 	•	韩红桂,甄琪,任柯燕等.基于孪生卷积神经网络的手机型号识别方法[J].北京工业大学学报,2021,47(02):112-119. 
 	•	付勇刚.基于卷积神经网络的废旧手机型号识别与应用研究[D].合肥：合肥工业大学，2022. 
+
+## 需要数据集的可以私我
