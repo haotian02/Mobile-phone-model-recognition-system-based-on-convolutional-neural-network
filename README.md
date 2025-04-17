@@ -42,6 +42,7 @@
 │   ├── Resnet50-CBAM-fc.pth  
 │   ├── Resnet50-CBAM-all.pth
 │   └── ...
+├── resnet_cbam.py
 ├── statistics.py
 ├── train1.py 
 ├── test1.py
