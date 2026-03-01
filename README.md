@@ -74,10 +74,4 @@
 	•	Tkinter
 	•	其他依赖请参见requirements.txt
 
-## 参考文献
-
-	•	A. G. Biney and H. Sellahewa, “Analysis of smartphone model identification using digital images,” presented at the 20th IEEE International Conference on Image Processing, Melbourne, Australia, 2015. 
-	•	韩红桂,甄琪,任柯燕等.基于孪生卷积神经网络的手机型号识别方法[J].北京工业大学学报,2021,47(02):112-119. 
-	•	付勇刚.基于卷积神经网络的废旧手机型号识别与应用研究[D].合肥：合肥工业大学，2022. 
-
 ## 需要数据集的可以私我
