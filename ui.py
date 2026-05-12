@@ -1,601 +1,588 @@
-import io
-import os
-import statistics
-import train1
-import test1
-import json
+import cgi
 import hashlib
+import html
+import importlib.util
+import io
+import json
+import os
+import threading
 import time
-from tkinter import *
-from tkinter import Label, filedialog, Tk, ttk, Button, Canvas, BOTH, NW, YES, messagebox
-from PIL import Image, ImageTk
-import resnet_cbam
+import traceback
+import re
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import test1
+import train1
 
 
-class UI:
-    def __init__(self, master):
-        self.style = ttk.Style()
-        self.video_processor = None
-        self.master = master
-        self.canvas = Canvas(master)
-        self.canvas.pack(fill=BOTH, expand=YES)
-        self.image = Image.open("./image/background.jpg")
-        self.img_copy = self.image.copy()
-        self.background = ImageTk.PhotoImage(self.image)
-        self.canvas.create_image(0, 0, image=self.background, anchor=NW)
-        self.canvas.bind("<Configure>", self.resize_image)
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
+CREDENTIALS_PATH = BASE_DIR / "credentials.json"
+PARAMETERS_PATH = BASE_DIR / "parameters.json"
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("PHONE_UI_PORT", "8000"))
 
-        # 创建一个打开新窗口的按钮
-        self.new_window_button = Button(self.canvas, text="打开新窗口", command=self.create_new_window)
 
-        # 创建一个账号输入框
-        self.username_entry = Entry(self.canvas)
-        self.username_entry.pack()
+def load_local_statistics_module():
+    module_path = BASE_DIR / "statistics.py"
+    spec = importlib.util.spec_from_file_location("phone_dataset_statistics", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-        # 创建一个密码输入框
-        self.password_entry = Entry(self.canvas, show="*")
-        self.password_entry.pack()
 
-        # 创建一个手机号输入框
-        self.phone_number_entry = Entry(self.canvas)
-        self.phone_number_entry.pack()
+dataset_statistics = load_local_statistics_module()
 
-        # 创建一个登录按钮
-        self.login_button = Button(self.canvas, text="登录", command=self.login)
-        self.login_button.pack()
 
-        # 创建一个注册按钮
-        self.register_button = Button(self.canvas, text="注册", command=self.register)
-        self.register_button.pack()
+BRAND_PATHS = {
+    "通用": ("./phone data/phone dataset/idx_to_labels.npy", "./checkpoint/Resnet50-CBAM-all.pth"),
+    "Apple": ("./phone data/phone name/Apple/idx_to_labels.npy", "./checkpoint/Apple.pth"),
+    "iqoo": ("./phone data/phone name/iqoo/idx_to_labels.npy", "./checkpoint/iqoo.pth"),
+    "oppo": ("./phone data/phone name/oppo/idx_to_labels.npy", "./checkpoint/oppo.pth"),
+    "realme": ("./phone data/phone name/realme/idx_to_labels.npy", "./checkpoint/realme.pth"),
+    "Samsung": ("./phone data/phone name/Samsung/idx_to_labels.npy", "./checkpoint/Samsung.pth"),
+    "vivo": ("./phone data/phone name/vivo/idx_to_labels.npy", "./checkpoint/vivo.pth"),
+    "红米": ("./phone data/phone name/红米/idx_to_labels.npy", "./checkpoint/红米.pth"),
+    "华为": ("./phone data/phone name/华为/idx_to_labels.npy", "./checkpoint/华为.pth"),
+    "魅族": ("./phone data/phone name/魅族/idx_to_labels.npy", "./checkpoint/魅族.pth"),
+    "努比亚": ("./phone data/phone name/努比亚/idx_to_labels.npy", "./checkpoint/努比亚.pth"),
+    "荣耀": ("./phone data/phone name/荣耀/idx_to_labels.npy", "./checkpoint/荣耀.pth"),
+    "小米": ("./phone data/phone name/小米/idx_to_labels.npy", "./checkpoint/小米.pth"),
+    "一加": ("./phone data/phone name/一加/idx_to_labels.npy", "./checkpoint/一加.pth"),
+}
 
-        # 创造一个重置按钮
-        self.reset_button = Button(self.canvas, text="重置", command=self.reset_password)
-        self.reset_button.pack()
 
-        # 创建标签
-        self.username_label = Label(self.canvas, text="账号")
-        self.password_label = Label(self.canvas, text="密码")
-        self.phone_number_label = Label(self.canvas, text="手机号")
+STATE = {
+    "message": "",
+    "user": None,
+    "last_output": "",
+    "last_image_path": "",
+    "training": {"running": False, "output": "", "started_at": None},
+}
 
-        # 创建一个字典来存储账号和密码
-        if os.path.exists('credentials.json'):
-            with open('credentials.json', 'r') as f:
-                self.credentials = json.load(f)
+
+def read_json(path, default):
+    if not path.exists():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def write_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def hash_password(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def safe_text(value):
+    return html.escape(str(value or ""))
+
+
+def safe_upload_name(filename):
+    suffix = Path(filename or "").suffix.lower() or ".jpg"
+    stem = Path(filename or "image").stem
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._") or "image"
+    return f"{stem}-{time.time_ns()}{suffix}"
+
+
+def app_layout(title, body, active="home"):
+    nav_items = [
+        ("home", "/", "控制台"),
+        ("detect", "/detect", "型号识别"),
+        ("train", "/train", "模型训练"),
+        ("dataset", "/dataset", "数据集处理"),
+        ("account", "/account", "账号"),
+    ]
+    nav = "".join(
+        f'<a class="{"active" if key == active else ""}" href="{href}">{label}</a>'
+        for key, href, label in nav_items
+    )
+    message = f'<div class="notice">{safe_text(STATE["message"])}</div>' if STATE["message"] else ""
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{safe_text(title)} - 手机型号识别系统</title>
+  <style>
+    :root {{
+      --bg: #f6f7fb;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #667085;
+      --line: #d9dee8;
+      --primary: #176b87;
+      --primary-strong: #0d5269;
+      --accent: #d97706;
+      --good: #0f766e;
+      --danger: #b42318;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }}
+    .shell {{
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 244px 1fr;
+    }}
+    aside {{
+      background: #10232d;
+      color: white;
+      padding: 28px 20px;
+    }}
+    .brand {{
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.25;
+      margin-bottom: 28px;
+    }}
+    .status {{
+      color: #b8c7d0;
+      font-size: 13px;
+      margin-bottom: 22px;
+    }}
+    nav a {{
+      display: block;
+      color: #d9e3e8;
+      text-decoration: none;
+      padding: 11px 12px;
+      border-radius: 8px;
+      margin-bottom: 6px;
+      font-size: 15px;
+    }}
+    nav a.active, nav a:hover {{ background: #1f4758; color: white; }}
+    main {{ padding: 30px; max-width: 1180px; width: 100%; }}
+    h1 {{ font-size: 28px; margin: 0 0 6px; letter-spacing: 0; }}
+    .subhead {{ color: var(--muted); margin: 0 0 24px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(12, 1fr); gap: 18px; }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 8px 24px rgba(16, 35, 45, 0.06);
+    }}
+    .span-4 {{ grid-column: span 4; }}
+    .span-6 {{ grid-column: span 6; }}
+    .span-8 {{ grid-column: span 8; }}
+    .span-12 {{ grid-column: span 12; }}
+    label {{ display: block; font-weight: 600; margin: 14px 0 6px; }}
+    input, select, textarea {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font: inherit;
+      background: white;
+    }}
+    textarea {{ min-height: 180px; resize: vertical; }}
+    button, .button {{
+      display: inline-block;
+      border: 0;
+      border-radius: 8px;
+      background: var(--primary);
+      color: white;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      margin-top: 14px;
+    }}
+    button:hover, .button:hover {{ background: var(--primary-strong); }}
+    .button.secondary {{ background: #475467; }}
+    .button.warn {{ background: var(--accent); }}
+    .notice {{
+      border-left: 4px solid var(--primary);
+      background: #e8f3f7;
+      padding: 12px 14px;
+      border-radius: 8px;
+      margin-bottom: 18px;
+    }}
+    pre {{
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #111827;
+      color: #e5e7eb;
+      padding: 16px;
+      border-radius: 8px;
+      overflow: auto;
+      min-height: 180px;
+    }}
+    .metric {{ font-size: 26px; font-weight: 800; margin-top: 8px; }}
+    .muted {{ color: var(--muted); }}
+    @media (max-width: 860px) {{
+      .shell {{ grid-template-columns: 1fr; }}
+      aside {{ padding: 20px; }}
+      main {{ padding: 20px; }}
+      .span-4, .span-6, .span-8 {{ grid-column: span 12; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="brand">手机型号<br>识别系统</div>
+      <div class="status">当前用户：{safe_text(STATE["user"] or "未登录")}</div>
+      <nav>{nav}</nav>
+    </aside>
+    <main>{message}{body}</main>
+  </div>
+</body>
+</html>"""
+
+
+def dashboard_page():
+    params = read_json(PARAMETERS_PATH, {})
+    body = f"""
+    <h1>控制台</h1>
+    <p class="subhead">本地模型训练、图片识别和数据集整理入口。</p>
+    <div class="grid">
+      <section class="panel span-4"><div class="muted">模型数量</div><div class="metric">{len(list((BASE_DIR / "checkpoint").glob("*.pth"))) if (BASE_DIR / "checkpoint").exists() else 0}</div></section>
+      <section class="panel span-4"><div class="muted">预设厂商</div><div class="metric">{len(BRAND_PATHS)}</div></section>
+      <section class="panel span-4"><div class="muted">训练状态</div><div class="metric">{"运行中" if STATE["training"]["running"] else "空闲"}</div></section>
+      <section class="panel span-12">
+        <h2>最近参数</h2>
+        <pre>{safe_text(json.dumps(params, ensure_ascii=False, indent=2))}</pre>
+      </section>
+    </div>"""
+    return app_layout("控制台", body, "home")
+
+
+def account_page():
+    body = """
+    <h1>账号</h1>
+    <p class="subhead">账号信息保存在本机 credentials.json，仅用于本地 Web 页面访问。</p>
+    <div class="grid">
+      <form class="panel span-4" method="post" action="/login">
+        <h2>登录</h2>
+        <label>账号</label><input name="username" required>
+        <label>密码</label><input name="password" type="password" required>
+        <button>登录</button>
+      </form>
+      <form class="panel span-4" method="post" action="/register">
+        <h2>注册</h2>
+        <label>账号</label><input name="username" required>
+        <label>密码</label><input name="password" type="password" required>
+        <label>手机号</label><input name="phone_number" required>
+        <button>注册</button>
+      </form>
+      <form class="panel span-4" method="post" action="/reset-password">
+        <h2>重置密码</h2>
+        <label>账号</label><input name="username" required>
+        <label>手机号</label><input name="phone_number" required>
+        <label>新密码</label><input name="password" type="password" required>
+        <button>重置</button>
+      </form>
+    </div>"""
+    return app_layout("账号", body, "account")
+
+
+def detect_page():
+    options = "".join(f'<option value="{safe_text(name)}">{safe_text(name)}</option>' for name in BRAND_PATHS)
+    params = read_json(PARAMETERS_PATH, {})
+    current_image_path = params.get("image_path") or STATE.get("last_image_path") or ""
+    output = safe_text(STATE["last_output"])
+    body = f"""
+    <h1>型号识别</h1>
+    <p class="subhead">选择预设厂商，或手动填写模型、标签和图片路径。</p>
+    <div class="grid">
+      <form class="panel span-6" method="post" action="/detect" enctype="multipart/form-data">
+        <label>厂商预设</label><select name="brand">{options}</select>
+        <label>模型路径</label><input name="model1_path" value="{safe_text(params.get("model1_path", ""))}">
+        <label>标签路径</label><input name="idx_to_labels_path" value="{safe_text(params.get("idx_to_labels_path", ""))}">
+        <label>图片路径</label><input id="image_path" name="image_path" value="{safe_text(current_image_path)}">
+        <label>或上传图片</label><input type="file" name="image_file" accept="image/*">
+        <button>开始识别</button>
+      </form>
+      <section class="panel span-6">
+        <h2>识别结果</h2>
+        <p class="muted">当前图片路径：{safe_text(current_image_path or "未选择")}</p>
+        <pre>{output}</pre>
+      </section>
+    </div>"""
+    return app_layout("型号识别", body, "detect")
+
+
+def train_page():
+    params = read_json(PARAMETERS_PATH, {})
+    output = safe_text(STATE["training"]["output"])
+    disabled = "disabled" if STATE["training"]["running"] else ""
+    body = f"""
+    <h1>模型训练</h1>
+    <p class="subhead">数据集目录需要包含 train 和 val 子目录。</p>
+    <div class="grid">
+      <form class="panel span-4" method="post" action="/train">
+        <label>数据集目录</label><input name="dataset_dir" value="{safe_text(params.get("dataset_dir", ""))}" required>
+        <label>预训练模型路径</label><input name="model_path" value="{safe_text(params.get("model_path", "./resnet50.pth"))}" required>
+        <label>Batch Size</label><input name="batch_size" type="number" value="{safe_text(params.get("batch_size", 16))}" min="1">
+        <label>Epochs</label><input name="epochs" type="number" value="{safe_text(params.get("epochs", 10))}" min="1">
+        <label>Step Size</label><input name="step_size" type="number" value="{safe_text(params.get("step_size", 5))}" min="1">
+        <label>Gamma</label><input name="gamma" type="number" value="{safe_text(params.get("gamma", 0.1))}" step="0.01">
+        <label>加载方式</label>
+        <select name="load_method">
+          <option value="init_and_load_model">微调 CBAM 模型</option>
+          <option value="load_model">微调普通 ResNet</option>
+          <option value="download_and_load_model">微调全部层</option>
+        </select>
+        <button {disabled}>开始训练</button>
+      </form>
+      <section class="panel span-8">
+        <h2>训练日志</h2>
+        <pre>{output}</pre>
+        <a class="button secondary" href="/train">刷新日志</a>
+      </section>
+    </div>"""
+    return app_layout("模型训练", body, "train")
+
+
+def dataset_page():
+    output = safe_text(STATE["last_output"])
+    body = f"""
+    <h1>数据集处理</h1>
+    <p class="subhead">划分训练/验证集，或对图片去重并统一为 RGB/JPEG。</p>
+    <div class="grid">
+      <form class="panel span-6" method="post" action="/dataset/split">
+        <h2>划分数据集</h2>
+        <label>数据集目录</label><input name="dataset_path" required>
+        <label>验证集比例</label><input name="test_frac" type="number" step="0.01" value="0.2" min="0.01" max="0.9">
+        <button>开始划分</button>
+      </form>
+      <form class="panel span-6" method="post" action="/dataset/convert">
+        <h2>图片去重与格式转换</h2>
+        <label>图片目录</label><input name="dataset_path" required>
+        <button class="warn">开始处理</button>
+      </form>
+      <section class="panel span-12">
+        <h2>处理输出</h2>
+        <pre>{output}</pre>
+      </section>
+    </div>"""
+    return app_layout("数据集处理", body, "dataset")
+
+
+class PhoneUIHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        route = urlparse(self.path).path
+        pages = {
+            "/": dashboard_page,
+            "/account": account_page,
+            "/detect": detect_page,
+            "/train": train_page,
+            "/dataset": dataset_page,
+        }
+        if route in pages:
+            self.respond_html(pages[route]())
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self):
+        route = urlparse(self.path).path
+        try:
+            if route == "/login":
+                self.handle_login()
+            elif route == "/register":
+                self.handle_register()
+            elif route == "/reset-password":
+                self.handle_reset_password()
+            elif route == "/detect":
+                self.handle_detect()
+            elif route == "/train":
+                self.handle_train()
+            elif route == "/dataset/split":
+                self.handle_dataset_split()
+            elif route == "/dataset/convert":
+                self.handle_dataset_convert()
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
+        except Exception:
+            STATE["message"] = "操作失败"
+            STATE["last_output"] = traceback.format_exc()
+            self.redirect("/")
+
+    def parse_form(self):
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.startswith("multipart/form-data"):
+            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST"})
+            data = {key: form.getvalue(key) for key in form.keys() if not getattr(form[key], "filename", None)}
+            files = {key: form[key] for key in form.keys() if getattr(form[key], "filename", None)}
+            return data, files
+
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        return {key: values[0] for key, values in parse_qs(body).items()}, {}
+
+    def handle_login(self):
+        data, _ = self.parse_form()
+        credentials = read_json(CREDENTIALS_PATH, {})
+        username = data.get("username", "").strip()
+        password_hash = hash_password(data.get("password", ""))
+        if username in credentials and credentials[username]["password"] == password_hash:
+            STATE["user"] = username
+            STATE["message"] = f"登录成功，欢迎 {username}"
         else:
-            self.credentials = {}
+            STATE["message"] = "账号或密码错误"
+        self.redirect("/account")
 
-    def hash_password(self, password):
-        # 创建一个新的哈希对象
-        hash_object = hashlib.sha256()
-        # 哈希密码
-        hash_object.update(password.encode('utf-8'))
-        # 返回哈希的十六进制表示
-        return hash_object.hexdigest()
+    def handle_register(self):
+        data, _ = self.parse_form()
+        username = data.get("username", "").strip()
+        password = data.get("password", "")
+        phone_number = data.get("phone_number", "").strip()
+        credentials = read_json(CREDENTIALS_PATH, {})
 
-    def login(self):
-        username = self.username_entry.get()
-        password = self.hash_password(self.password_entry.get())
-        if username in self.credentials and self.credentials[username]['password'] == password:
-            messagebox.showinfo("登录成功", "欢迎 {}!".format(username))
-            self.create_new_window()
+        if not username.isalnum():
+            STATE["message"] = "账号只能包含字母和数字"
+        elif not phone_number.isdigit():
+            STATE["message"] = "手机号只能包含数字"
+        elif username in credentials:
+            STATE["message"] = "该账号已注册"
         else:
-            messagebox.showerror("登录失败", "账号或密码错误")
+            credentials[username] = {
+                "password": hash_password(password),
+                "phone_number": hash_password(phone_number),
+            }
+            write_json(CREDENTIALS_PATH, credentials)
+            STATE["message"] = f"账号 {username} 注册成功"
+        self.redirect("/account")
 
-    def register(self):
-        username = self.username_entry.get()
-        password = self.hash_password(self.password_entry.get())
-        phone_number = self.phone_number_entry.get()
+    def handle_reset_password(self):
+        data, _ = self.parse_form()
+        username = data.get("username", "").strip()
+        phone_hash = hash_password(data.get("phone_number", "").strip())
+        credentials = read_json(CREDENTIALS_PATH, {})
+        if username in credentials and credentials[username]["phone_number"] == phone_hash:
+            credentials[username]["password"] = hash_password(data.get("password", ""))
+            write_json(CREDENTIALS_PATH, credentials)
+            STATE["message"] = "密码已重置"
+        else:
+            STATE["message"] = "账号或手机号错误"
+        self.redirect("/account")
 
-        if not phone_number.isdigit():
-            messagebox.showerror("注册失败", "手机号码只能包含数字")
+    def handle_detect(self):
+        data, files = self.parse_form()
+        brand = data.get("brand") or "通用"
+        idx_path, model_path = BRAND_PATHS.get(brand, ("", ""))
+        model_path = data.get("model1_path") or model_path
+        idx_path = data.get("idx_to_labels_path") or idx_path
+        image_path = data.get("image_path") or ""
+
+        uploaded = files.get("image_file")
+        if uploaded is not None and uploaded.filename:
+            UPLOAD_DIR.mkdir(exist_ok=True)
+            image_path = str(UPLOAD_DIR / safe_upload_name(uploaded.filename))
+            with open(image_path, "wb") as f:
+                f.write(uploaded.file.read())
+
+        params = {
+            "idx_to_labels_path": idx_path,
+            "model1_path": model_path,
+            "image_path": image_path,
+        }
+        write_json(PARAMETERS_PATH, params)
+        buffer = io.StringIO()
+        processor = test1.VideoProcessor(model1_path=model_path, idx_to_labels_path=idx_path, image_path=image_path)
+        processor.run_detection("image", image_path, buffer)
+        STATE["last_output"] = buffer.getvalue()
+        STATE["last_image_path"] = image_path
+        STATE["message"] = f"识别完成，当前图片路径已更新为: {image_path}"
+        self.redirect("/detect")
+
+    def handle_train(self):
+        if STATE["training"]["running"]:
+            STATE["message"] = "训练任务正在运行"
+            self.redirect("/train")
             return
 
-        if not (username.isalnum() and password.isalnum()):
-            messagebox.showerror("注册失败", "账号和密码只能包含字母和数字")
-            return
-
-        if username in self.credentials:
-            messagebox.showerror("注册失败", "该用户名已被注册")
-            return
-
-        hashed_password = self.hash_password(password)
-        hashed_phone_number = self.hash_password(phone_number)
-
-        self.credentials[username] = {'password': hashed_password, 'phone_number': hashed_phone_number}
-        with open('credentials.json', 'w') as f:
-            json.dump(self.credentials, f)
-
-        messagebox.showinfo("注册成功", "账号 {} 已成功注册!".format(username))
-
-    def reset_password(self):
-        username = self.username_entry.get()
-        phone_number = self.hash_password(self.phone_number_entry.get())  # 对输入的手机号进行哈希加密
-        if username in self.credentials and self.credentials[username]['phone_number'] == phone_number:
-            new_password = self.password_entry.get()
-            self.credentials[username]['password'] = self.hash_password(new_password)
-            with open('credentials.json', 'w') as f:
-                json.dump(self.credentials, f)
-            messagebox.showinfo("密码重置成功", "账号 {} 的密码已成功重置!".format(username))
-        else:
-            messagebox.showerror("密码重置失败", "账号或手机号码错误")
-
-    def resize_image(self, event):
-        new_width = event.width
-        new_height = event.height
-        self.image = self.img_copy.resize((new_width, new_height), Image.LANCZOS)
-        self.background = ImageTk.PhotoImage(self.image)
-        self.canvas.create_image(0, 0, image=self.background, anchor=NW)
-        # self.new_window_button.place(x=new_width * 0.1, y=new_height * 0.2)  # 更新打开新窗口按钮的位置
-        self.login_button.place(x=new_width * 0.35, y=new_height * 0.6)
-        self.register_button.place(x=new_width * 0.5, y=new_height * 0.6)
-        self.username_entry.place(x=new_width * 0.4, y=new_height * 0.3)
-        self.password_entry.place(x=new_width * 0.4, y=new_height * 0.4)
-        self.phone_number_entry.place(x=new_width * 0.4, y=new_height * 0.5)
-        self.reset_button.place(x=new_width * 0.43, y=new_height * 0.6)
-
-        self.username_label.place(x=new_width * 0.35, y=new_height * 0.3)
-        self.password_label.place(x=new_width * 0.35, y=new_height * 0.4)
-        self.phone_number_label.place(x=new_width * 0.35, y=new_height * 0.5)
-
-    def create_new_window(self):
-        self.master.withdraw()
-        self.new_window = Toplevel(self.master)
-        self.new_window.title("主界面")
-        self.new_window.geometry(f'{self.master.winfo_width()}x{self.master.winfo_height()}')  # 设置新窗口的大小与原窗口一致
-
-        # 设置新窗口的背景
-        self.new_image = Image.open("./image/background0.jpg")
-        self.new_img_copy = self.new_image.copy()
-        self.new_background = ImageTk.PhotoImage(self.new_image)
-        self.new_canvas = Canvas(self.new_window)
-        self.new_canvas.create_image(0, 0, image=self.new_background, anchor=NW)
-        self.new_canvas.bind("<Configure>", self.resize_new_image)  # 绑定新窗口的背景图像的缩放函数
-        self.new_canvas.pack(fill=BOTH, expand=YES)
-
-        # 在新窗口关闭时重新显示主窗口，可以通过为新窗口绑定一个关闭事件来实现
-        self.new_window.protocol("WM_DELETE_WINDOW", self.on_close_new_window)
-
-        # 创建一个训练模型的按钮
-        self.train_model_button = Button(self.new_window, text="训练手机型号模型", command=self.train_model)
-        self.train_model_button_window = self.new_canvas.create_window(400, 150, anchor="nw", window=self.train_model_button)
-
-        # 创建一个测试模型的按钮
-        self.test_model_button = Button(self.new_window, text="手机型号识别", command=self.test_model)
-        self.test_model_button_window = self.new_canvas.create_window(400, 200, anchor="nw", window=self.test_model_button)
-
-        self.statistics_model_button = Button(self.new_window, text="分类手机型号数据集", command=self.statistics_model)
-        self.statistics_model_button_window = self.new_canvas.create_window(400, 250, anchor="nw", window=self.statistics_model_button)
-
-    def resize_new_image(self, event):
-        new_width = event.width
-        new_height = event.height
-        self.new_image = self.new_img_copy.resize((new_width, new_height), Image.LANCZOS)
-        self.new_background = ImageTk.PhotoImage(self.new_image)
-        self.new_canvas.create_image(0, 0, image=self.new_background, anchor=NW)
-
-    def on_close_new_window(self):
-        # 关闭新窗口
-        self.new_window.destroy()
-        # 重新显示（原）根窗口
-        self.master.deiconify()
-
-    def train_model(self):
-        # 首先检查new_window是否存在并隐藏
-        if hasattr(self, 'create_new_window'):
-            self.new_window.withdraw()
-
-        self.train_window = Toplevel(self.master)
-        self.train_window.title("训练模型")
-        self.train_window.geometry(f'{self.master.winfo_width()}x{self.master.winfo_height()}')  # 设置新窗口的大小与原窗口一致
-
-        # 设置新窗口的背景
-        self.train_image = Image.open("./image/background0.jpg")
-        self.train_img_copy = self.train_image.copy()
-        self.train_background = ImageTk.PhotoImage(self.train_image)
-        self.train_canvas = Canvas(self.train_window)
-        self.train_canvas.create_image(0, 0, image=self.train_background, anchor=NW)
-        self.train_canvas.bind("<Configure>", self.resize_train_image)  # 绑定新窗口的背景图像的缩放函数
-        self.train_canvas.pack(fill=BOTH, expand=YES)
-
-        self.train_window.protocol("WM_DELETE_WINDOW", self.on_close_train_window)
-
-        # 创建输入框
-        self.batch_size_entry = Entry(self.train_window)
-        self.epochs_entry = Entry(self.train_window)
-        self.step_size_entry = Entry(self.train_window)
-        self.gamma_entry = Entry(self.train_window)
-
-        # 创建文件选择框
-        self.dataset_dir_button = Button(self.train_window, text="添加数据集", command=self.open_file)
-
-        # 创建模型路径按钮
-        self.model_path_button1 = Button(self.train_window, text="resnet34",
-                                         command=lambda: self.select_model_path("resnet34.pth"))
-        self.model_path_button2 = Button(self.train_window, text="resnet50",
-                                         command=lambda: self.select_model_path("resnet50.pth"))
-
-        # 创建加载方法按钮
-        self.load_method_button1 = Button(self.train_window, text="微调全连接层",
-                                          command=lambda: self.select_load_method("load_model"))
-        self.load_method_button2 = Button(self.train_window, text="微调所有层",
-                                          command=lambda: self.select_load_method("download_and_load_model"))
-
-        # 创建输出文本框
-        self.result_text = Text(self.train_window)
-
-        # 创建训练按钮
-        self.train_button = Button(self.train_window, text="训练", command=self.start_training)
-        self.train_button_window = self.train_canvas.create_window(500, 600, anchor="nw", window=self.train_button)
-
-        # 创建标签
-        self.batch_size_label = Label(self.train_window, text="Batch Size")
-        self.epochs_label = Label(self.train_window, text="epochs")
-        self.step_size_label = Label(self.train_window, text="step size")
-        self.gamma_label = Label(self.train_window, text="gamma")
-
-        # 将标签添加到画布上
-        self.train_canvas.create_window(80, 100, window=self.batch_size_label)
-        self.train_canvas.create_window(80, 150, window=self.epochs_label)
-        self.train_canvas.create_window(80, 200, window=self.step_size_label)
-        self.train_canvas.create_window(80, 250, window=self.gamma_label)
-
-        # 将组件添加到画布上
-        self.train_canvas.create_window(200, 100, window=self.batch_size_entry)
-        self.train_canvas.create_window(200, 150, window=self.epochs_entry)
-        self.train_canvas.create_window(200, 200, window=self.step_size_entry)
-        self.train_canvas.create_window(200, 250, window=self.gamma_entry)
-        self.train_canvas.create_window(200, 300, window=self.dataset_dir_button)
-        self.train_canvas.create_window(200, 350, window=self.model_path_button1)
-        self.train_canvas.create_window(200, 400, window=self.model_path_button2)
-        self.train_canvas.create_window(200, 450, window=self.load_method_button1)
-        self.train_canvas.create_window(200, 500, window=self.load_method_button2)
-        self.train_canvas.create_window(600, 200, window=self.result_text)
-        self.train_canvas.create_window(600, 450, window=self.train_button)
-
-    def resize_train_image(self, event):
-        new_width = event.width
-        new_height = event.height
-        self.train_image = self.train_img_copy.resize((new_width, new_height), Image.LANCZOS)
-        self.train_background = ImageTk.PhotoImage(self.train_image)
-        self.train_canvas.create_image(0, 0, image=self.train_background, anchor=NW)
-
-    def on_close_train_window(self):
-        # 销毁train_window
-        if hasattr(self, 'train_window'):
-            self.train_window.destroy()
-            delattr(self, 'train_window')  # 删除属性，防止后续错误
-
-        # 检查new_window是否存在并重新显示
-        if hasattr(self, 'new_window'):
-            self.new_window.deiconify()
-
-    def open_file(self):
-        self.filename = filedialog.askdirectory()  # 获取文件夹路径并保存到实例变量中
-        self.result_text.insert(END, f"选中的数据集路径是：{self.filename}\n")  # 将文件路径插入到文本框中
-
-    def select_model_path(self, model_path):
-        self.model_path = model_path
-        self.result_text.insert(END, f"选中的模型路径是：{model_path}\n")
-
-    def select_load_method(self, load_method):
-        self.load_method = load_method
-
-        # 根据load_method的值更改输出消息
-        if load_method == "load_model":
-            message = "选中的操作是：微调全连接层"
-        elif load_method == "download_and_load_model":
-            message = "选中的操作是：微调所有层"
-        else:
-            message = f"选中的操作是：{load_method}"  # 对于其他情况，直接显示load_method的值
-
-        # 在结果文本框中插入相应的消息
-        self.result_text.insert(END, f"{message}\n")
-
-    def start_training(self):
-        # 获取输入框和列表框的值
-        batch_size = int(self.batch_size_entry.get())
-        epochs = int(self.epochs_entry.get())
-        step_size = float(self.step_size_entry.get())
-        gamma = float(self.gamma_entry.get())
-        dataset_dir = self.filename  # 使用在 open_file 方法中保存的文件路径
-        model_path = self.model_path  # 使用保存的模型路径
-        load_method = self.load_method
-
-        # 显示输入的参数
-        self.result_text.insert(END, f"batch_size={batch_size}\n")
-        self.result_text.insert(END, f"epochs={epochs}\n")
-        self.result_text.insert(END, f"step_size={step_size}\n")
-        self.result_text.insert(END, f"gamma={gamma}\n")
-        self.result_text.insert(END, f"dataset_dir={dataset_dir}\n")
-
-        # 将参数保存到一个文件中
-        parameters = {
-            'batch_size': batch_size,
-            'epochs': epochs,
-            'step_size': step_size,
-            'gamma': gamma,
-            'dataset_dir': dataset_dir,
-            'model_path': model_path,
-            'load_method': load_method,
-            'save': dataset_dir
+        data, _ = self.parse_form()
+        params = {
+            "dataset_dir": data["dataset_dir"],
+            "model_path": data["model_path"],
+            "batch_size": int(data.get("batch_size") or 16),
+            "epochs": int(data.get("epochs") or 10),
+            "step_size": int(float(data.get("step_size") or 5)),
+            "gamma": float(data.get("gamma") or 0.1),
+            "load_method": data.get("load_method") or "init_and_load_model",
+            "save": data["dataset_dir"],
         }
-        with open('parameters.json', 'w') as f:
-            json.dump(parameters, f)
+        write_json(PARAMETERS_PATH, params)
+        STATE["training"] = {"running": True, "output": "训练已启动...\n", "started_at": time.time()}
 
-        # 创建更新UI的回调函数
-        def update_output(line):
-            self.result_text.insert(END, line)
-            self.result_text.see(END)  # 滚动到文本框底部
-            self.master.update()  # 更新UI
+        def run_training():
+            try:
+                def emit(line):
+                    STATE["training"]["output"] += str(line)
 
-        # 初始化并开始训练模型
-        classifier = train1.PhoneClassifier(**parameters)
-        classifier.train(update_output)  # 使用回调函数
+                classifier = train1.PhoneClassifier(**params)
+                classifier.train(emit)
+                STATE["message"] = "训练完成"
+            except Exception:
+                STATE["training"]["output"] += "\n" + traceback.format_exc()
+                STATE["message"] = "训练失败"
+            finally:
+                STATE["training"]["running"] = False
 
-        # 输出训练成功信息
-        self.result_text.insert(END, "训练模型成功！\n")
+        threading.Thread(target=run_training, daemon=True).start()
+        self.redirect("/train")
 
-    def resize_test_image(self, event):
-        new_width = event.width
-        new_height = event.height
-        self.test_image = self.test_img_copy.resize((new_width, new_height), Image.LANCZOS)
-        self.test_background = ImageTk.PhotoImage(self.test_image)
-        self.test_canvas.create_image(0, 0, image=self.test_background, anchor=NW)
-        self.test_canvas.config(width=new_width, height=new_height)
+    def handle_dataset_split(self):
+        data, _ = self.parse_form()
+        dataset_path = data["dataset_path"]
+        test_frac = float(data.get("test_frac") or 0.2)
+        buffer = io.StringIO()
+        splitter = dataset_statistics.DatasetSplitter(dataset_path=dataset_path, test_frac=test_frac)
+        splitter.create_folders()
+        splitter.split_dataset(buffer.write)
+        splitter.save_statistics()
+        STATE["last_output"] = buffer.getvalue()
+        STATE["message"] = "数据集划分完成"
+        self.redirect("/dataset")
 
-    def test_model(self):
-        if hasattr(self, 'new_window'):
-            self.new_window.withdraw()
+    def handle_dataset_convert(self):
+        data, _ = self.parse_form()
+        dataset_path = data["dataset_path"]
+        buffer = io.StringIO()
+        splitter = dataset_statistics.DatasetSplitter(dataset_path=dataset_path, test_frac=0.2)
+        splitter.remove_duplicates_and_convert_images(callback=buffer.write, directory=dataset_path)
+        STATE["last_output"] = buffer.getvalue()
+        STATE["message"] = "图片处理完成"
+        self.redirect("/dataset")
 
-        self.test_window = Toplevel(self.master)
-        self.test_window.title("手机型号识别")
-        self.test_window.geometry(f'{self.master.winfo_width()}x{self.master.winfo_height()}')  # 设置新窗口的大小与原窗口一致
+    def respond_html(self, content):
+        body = content.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-        # 设置新窗口的背景
-        self.test_image = Image.open("./image/background0.jpg")
-        self.test_img_copy = self.test_image.copy()
-        self.test_background = ImageTk.PhotoImage(self.test_image)
-        self.test_canvas = Canvas(self.test_window)
-        self.test_canvas.create_image(0, 0, image=self.test_background, anchor=NW)
-        self.test_canvas.bind("<Configure>", self.resize_test_image)  # 绑定新窗口的背景图像的缩放函数
-        self.test_canvas.pack(fill=BOTH, expand=YES)
+    def redirect(self, location):
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.end_headers()
 
-        self.test_window.protocol("WM_DELETE_WINDOW", self.on_close_test_window)
+    def log_message(self, format, *args):
+        return
 
-        # 创建一个Label用于显示摄像头的输出
-        self.camera_output = Label(self.test_window)
-        self.camera_output.pack()
 
-        # 创建一个可以折叠的选择框
-        self.phone_brands_combobox = ttk.Combobox(self.test_window)
-        # 添加手机品牌到选择框
-        phone_brands = ["通用", "Apple", "iqoo", "oppo", "realme", "Samsung", "vivo", "红米", "华为", "魅族", "努比亚", "荣耀",
-                        "小米", "一加"]
-        self.phone_brands_combobox['values'] = phone_brands
-        self.phone_brands_combobox.pack()
-        self.phone_brands_combobox.bind("<<ComboboxSelected>>", self.update_paths)
+def run_server(host=HOST, port=PORT):
+    server = ThreadingHTTPServer((host, port), PhoneUIHandler)
+    print(f"手机型号识别 Web 页面已启动: http://{host}:{port}")
+    print("按 Ctrl+C 停止服务")
+    server.serve_forever()
 
-        self.brand_paths = {
-            "通用": ("./phone data/phone dataset/idx_to_labels.npy", "./checkpoint/Resnet50-CBAM-all.pth"),
-            "Apple": ("./phone data/phone name/Apple/idx_to_labels.npy", "./checkpoint/Apple.pth"),
-            "iqoo": ("./phone data/phone name/iqoo/idx_to_labels.npy", "./checkpoint/iqoo.pth"),
-            "oppo": ("./phone data/phone name/oppo/idx_to_labels.npy", "./checkpoint/oppo.pth"),
-            "realme": ("./phone data/phone name/realme/idx_to_labels.npy", "./checkpoint/realme.pth"),
-            "Samsung": ("./phone data/phone name/Samsung/idx_to_labels.npy", "./checkpoint/Samsung.pth"),
-            "vivo": ("./phone data/phone name/vivo/idx_to_labels.npy", "./checkpoint/vivo.pth"),
-            "红米": ("./phone data/phone name/红米/idx_to_labels.npy", "./checkpoint/红米.pth"),
-            "华为": ("./phone data/phone name/华为/idx_to_labels.npy", "./checkpoint/华为.pth"),
-            "魅族": ("./phone data/phone name/魅族/idx_to_labels.npy", "./checkpoint/魅族.pth"),
-            "努比亚": ("./phone data/phone name/努比亚/idx_to_labels.npy", "./checkpoint/努比亚.pth"),
-            "荣耀": ("./phone data/phone name/荣耀/idx_to_labels.npy", "./checkpoint/荣耀.pth"),
-            "小米": ("./phone data/phone name/小米/idx_to_labels.npy", "./checkpoint/小米.pth"),
-            "一加": ("./phone data/phone name/一加/idx_to_labels.npy", "./checkpoint/一加.pth"),
-        }
 
-        # 创建三个文件选择按钮
-        self.model1_path_button = Button(self.test_window, text="选择模型路径", command=self.select_model1_path)
-        self.model1_path_button.pack()
-
-        self.idx_to_labels_path_button = Button(self.test_window, text="选择标签路径", command=self.select_idx_to_labels_path)
-        self.idx_to_labels_path_button.pack()
-
-        self.image_path_button = Button(self.test_window, text="选择图像路径", command=self.select_image_path)
-        self.image_path_button.pack()
-
-        # 创建一个名为"测试"的按钮，按下后执行start_testing函数
-        self.test_button = Button(self.test_window, text="摄像头检测", command=self.start_testing_realtime)
-        self.test_button.pack()
-
-        # 创建一个名为"检测"的按钮，按下后执行start_testing函数
-        self.detect_button = Button(self.test_window, text="图片检测", command=self.start_testing_image)
-        self.detect_button.pack()
-
-        # 创建一个文本输出框
-        self.output_text = Text(self.test_window)
-
-        self.select_label = Label(self.test_window, text="选择厂商")
-
-        self.test_canvas.create_window(500, 400, window=self.model1_path_button)  # 将文件选择按钮添加到画布上
-        self.test_canvas.create_window(500, 450, window=self.idx_to_labels_path_button)  # 将文件选择按钮添加到画布上
-        self.test_canvas.create_window(500, 500, window=self.image_path_button)  # 将文件选择按钮添加到画布上
-        self.test_canvas.create_window(700, 400, window=self.test_button)  # 将测试按钮添加到画布上
-        self.test_canvas.create_window(700, 500, window=self.detect_button)
-        self.test_canvas.create_window(500, 200, window=self.output_text)
-        self.test_canvas.create_window(240, 450, window=self.select_label)
-        self.test_canvas.create_window(350, 450, window=self.phone_brands_combobox)  # 将列表选择框添加到画布上
-
-    def on_close_test_window(self):
-        if hasattr(self, 'test_window'):
-            self.test_window.destroy()
-            delattr(self, 'test_window')  # 删除属性，防止后续错误
-
-            # 检查new_window是否存在并重新显示
-        if hasattr(self, 'new_window'):
-            self.new_window.deiconify()
-
-    def select_model1_path(self):
-        self.model1_path = filedialog.askopenfilename()
-        self.output_text.insert(END, '选中的模型路径是：' + self.model1_path + '\n')
-
-    def select_idx_to_labels_path(self):
-        self.idx_to_labels_path = filedialog.askopenfilename()
-        self.output_text.insert(END, '选中的模型标签路径是：' + self.idx_to_labels_path + '\n')
-
-    def select_image_path(self):
-        self.image_path = filedialog.askopenfilename()
-        self.output_text.insert(END, '选中的图像路径是：' + self.image_path + '\n')
-
-    def start_testing_realtime(self):
-        self.start_testing('realtime', '')
-
-    def start_testing_image(self):
-        self.start_testing('image', self.image_path)
-
-    def update_paths(self, event=None):
-        selected_brand = self.phone_brands_combobox.get()
-        self.idx_to_labels_path, self.model1_path = self.brand_paths.get(selected_brand, ("", ""))
-
-        # 将路径写入parameters.json文件
-        with open('parameters.json', 'w') as f:
-            json.dump({
-                'idx_to_labels_path': self.idx_to_labels_path,
-                'model1_path': self.model1_path,
-                'image_path': self.image_path
-            }, f)
-
-        self.output_text.insert(END, '选中的模型路径是：' + self.model1_path + '\n')
-        self.output_text.insert(END, '选中的模型标签路径是：' + self.idx_to_labels_path + '\n')
-
-    def start_testing(self, mode, image_path):
-        idx_to_labels_path = self.idx_to_labels_path
-        model1_path = self.model1_path
-        image_path = self.image_path
-
-        with open('parameters.json', 'w') as f:
-            json.dump({
-                'idx_to_labels_path': idx_to_labels_path,
-                'model1_path': model1_path,
-                'image_path': image_path
-            }, f)
-
-        output = io.StringIO()
-
-        classifiers = test1.VideoProcessor(model1_path=model1_path, idx_to_labels_path=idx_to_labels_path, image_path=image_path)
-        classifiers.run_detection(mode, image_path, output)
-
-        # 将缓冲区的内容添加到输出文本框中
-        output_content = output.getvalue()
-        if output_content:  # 检查内容是否非空
-            self.output_text.insert(END, "识别置信度由大到小前五的手机型号: \n" + output_content)
-
-    def statistics_model(self):
-        if hasattr(self, 'new_window'):
-            self.new_window.withdraw()
-        self.statistics_window = Toplevel(self.master)
-        self.statistics_window.title("分类手机型号数据集")
-        self.statistics_window.geometry(f'{self.master.winfo_width()}x{self.master.winfo_height()}')  # 设置新窗口的大小与原窗口一致
-
-        # 设置新窗口的背景
-        self.statistics_image = Image.open("./image/background0.jpg")
-        self.statistics_img_copy = self.statistics_image.copy()
-        self.statistics_background = ImageTk.PhotoImage(self.statistics_image)
-        self.statistics_canvas = Canvas(self.statistics_window)
-        self.statistics_canvas.create_image(0, 0, image=self.statistics_background, anchor=NW)
-        self.statistics_canvas.bind("<Configure>", self.resize_statistics_image)  # 绑定新窗口的背景图像的缩放函数
-        self.statistics_canvas.pack(fill=BOTH, expand=YES)
-
-        self.statistics_window.protocol("WM_DELETE_WINDOW", self.on_close_statistics_window)
-
-        self.test_frac_entry = Entry(self.statistics_window)
-
-        self.put_text = Text(self.statistics_window)
-
-        self.statistics_button = Button(self.statistics_window, text="分类", command=self.start_statistics)
-        self.statistics_button.pack()
-
-        self.statistics_dir_button = Button(self.statistics_window, text="添加数据集路径", command=self.statistics_path)
-
-        self.test_frac_label = Label(self.statistics_window, text="划分测试集比例系数")
-
-        self.convert_colors_button = Button(self.statistics_window, text="图像去重和转化颜色格式", command=self.convert_colors)
-        self.convert_colors_button.pack()
-
-        # 将标签添加到画布上
-        self.statistics_canvas.create_window(350, 400, window=self.test_frac_label)
-
-        self.statistics_canvas.create_window(500, 500, window=self.statistics_button)
-        self.statistics_canvas.create_window(500, 450, window=self.statistics_dir_button)
-        self.statistics_canvas.create_window(500, 200, window=self.put_text)
-        self.statistics_canvas.create_window(500, 400, window=self.test_frac_entry)
-        self.statistics_canvas.create_window(650, 400, window=self.convert_colors_button)
-
-    def on_close_statistics_window(self):
-        if hasattr(self, 'statistics_window'):
-            self.statistics_window.destroy()
-            delattr(self, 'statistics_window')  # 删除属性，防止后续错误
-
-            # 检查new_window是否存在并重新显示
-        if hasattr(self, 'new_window'):
-            self.new_window.deiconify()
-
-    def resize_statistics_image(self, event):
-        new_width = event.width
-        new_height = event.height
-        self.statistics_image = self.new_img_copy.resize((new_width, new_height), Image.LANCZOS)
-        self.statistics_background = ImageTk.PhotoImage(self.new_image)
-        self.statistics_canvas.create_image(0, 0, image=self.new_background, anchor=NW)
-
-    def convert_colors(self):
-        # 定义一个回调函数，用于将输出直接添加到文本框中
-        def update_output(message):
-            self.put_text.insert(END, message)  # 将消息添加到文本框
-            self.put_text.see(END)  # 滚动到文本框底部
-            self.master.update()  # 更新 GUI 界面
-
-        # 初始化 DatasetSplitter 对象
-        self.dataset_splitter = statistics.DatasetSplitter(dataset_path=self.filepath, test_frac=None)
-
-        # 使用 update_output 函数作为回调
-        self.dataset_splitter.remove_duplicates_and_convert_images(callback=update_output, directory=self.filepath)
-
-        # 输出处理成功的消息
-        self.put_text.insert(END, "图像去重和转化颜色格式成功！\n")
-
-    def statistics_path(self):
-        self.filepath = filedialog.askdirectory()  # 获取文件夹路径并保存到实例变量中
-        if self.filepath:  # 检查用户是否选择了路径
-            self.put_text.insert(END, f"选中的数据集路径是：{self.filepath}\n")
-        else:
-            self.put_text.insert(END, "没有选择路径。\n")
-
-    def start_statistics(self):
-        test_frac = float(self.test_frac_entry.get())
-        dataset_path = self.filepath
-
-        self.put_text.insert(END, f"数据集中测试集的比值为：{test_frac}\n")
-        self.put_text.insert(END, f"数据集路径：{dataset_path}\n")
-
-        parameters = {
-            'dataset_path': dataset_path,
-            'test_frac': test_frac
-        }
-        with open('parameters.json', 'w') as f:
-            json.dump(parameters, f)
-
-        # 创建更新UI的回调函数
-        def update_output(line):
-            self.put_text.insert(END, line)
-            self.put_text.see(END)  # 滚动到文本框底部
-            self.master.update()  # 更新UI
-
-        classifiers = statistics.DatasetSplitter(**parameters)
-        classifiers.split_dataset(update_output)
-
-        self.put_text.insert(END, "数据集分类成功！\n")
-
-if __name__ == '__main__':
-    root = Tk()
-    root.geometry('1000x600')  # 设置窗口的初始大小为800x600
-    app = UI(root)
-    root.title("手机型号识别程序")
-    root.mainloop()
+if __name__ == "__main__":
+    run_server()

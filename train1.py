@@ -1,335 +1,285 @@
-import json
 import io
+import json
 import os
-from tqdm import tqdm
-import pandas as pd
+from pathlib import Path
+from typing import Callable, Dict, Optional, Tuple, Union
+
 import numpy as np
-import time
-import wandb
-import urllib.request
+import pandas as pd
 import torch
 import torch.nn as nn
-from torchvision import models
 import torch.optim as optim
-from torch.optim import lr_scheduler
-import PIL.Image
-import PIL.ExifTags
-import matplotlib.pyplot as plt
-import warnings
-warnings.filterwarnings("ignore")
-from sklearn.metrics import precision_score
-from sklearn.metrics import recall_score
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import f1_score
-from sklearn.metrics import roc_auc_score
-from PIL import ImageOps
 from PIL import ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from torch.utils.data import DataLoader
-from torchvision import transforms
-from torchvision import datasets
-import resnet_cbam
+from torchvision import datasets, models, transforms
+from tqdm import tqdm
+
 from resnet_cbam import resnet34_cbam, resnet50_cbam
 
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_path(path: Optional[Union[str, os.PathLike]]) -> Optional[Path]:
+    if not path:
+        return None
+    value = Path(path)
+    return value if value.is_absolute() else BASE_DIR / value
+
+
 class PhoneClassifier:
-    def __init__(self, dataset_dir, model_path, batch_size, epochs, step_size, gamma, load_method, save):
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-        print('device', self.device)
-        self.dataset_dir = dataset_dir
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.step_size = step_size
-        self.gamma = gamma
+    """Train a ResNet/CBAM phone classifier from an ImageFolder dataset."""
 
-        # 训练集图像预处理：缩放裁剪、图像增强、转 Tensor、归一化
-        self.train_transform = transforms.Compose([transforms.RandomResizedCrop(224),
-                                      transforms.RandomHorizontalFlip(),
-                                      transforms.ToTensor(),
-                                      transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-                                     ])
+    def __init__(
+        self,
+        dataset_dir,
+        model_path,
+        batch_size=16,
+        epochs=10,
+        step_size=5,
+        gamma=0.1,
+        load_method="init_and_load_model",
+        save=None,
+    ):
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.dataset_dir = resolve_path(dataset_dir)
+        self.model_path = resolve_path(model_path)
+        self.batch_size = int(batch_size)
+        self.epochs = int(epochs)
+        self.step_size = int(float(step_size))
+        self.gamma = float(gamma)
+        self.load_method = load_method
+        self.output_dir = resolve_path(save) or self.dataset_dir
+        self.checkpoint_dir = self.output_dir / "checkpoint"
 
-        # 测试集图像预处理：缩放、裁剪、转 Tensor、归一化
-        self.test_transform = transforms.Compose([transforms.Resize(256),
-                                     transforms.CenterCrop(224),
-                                     transforms.ToTensor(),
-                                     transforms.Normalize(
-                                         mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-                                    ])
+        self._validate_paths()
+        self.train_transform, self.test_transform = self._build_transforms()
+        self.train_path = self.dataset_dir / "train"
+        self.test_path = self.dataset_dir / "val"
 
-        # 数据集文件夹路径
-        self.train_path = os.path.join(dataset_dir, 'train')
-        self.test_path = os.path.join(dataset_dir, 'val')
-        print('训练集路径', self.train_path)
-        print('测试集路径', self.test_path)
-
-        # 载入训练集
-        self.train_dataset = datasets.ImageFolder(self.train_path, self.train_transform)
-        # 载入测试集
-        self.test_dataset = datasets.ImageFolder(self.test_path, self.test_transform)
-
-        # 各类别名称
+        self.train_dataset = datasets.ImageFolder(str(self.train_path), self.train_transform)
+        self.test_dataset = datasets.ImageFolder(str(self.test_path), self.test_transform)
         self.class_names = self.train_dataset.classes
         self.n_class = len(self.class_names)
-        # 映射关系：索引号 到 类别
         self.idx_to_labels = {y: x for x, y in self.train_dataset.class_to_idx.items()}
 
-        # 保存为本地的 npy 文件
-        np.save(os.path.join(save, 'idx_to_labels.npy'), self.idx_to_labels)
-        np.save(os.path.join(save, 'labels_to_idx.npy'), self.train_dataset.class_to_idx)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        np.save(self.output_dir / "idx_to_labels.npy", self.idx_to_labels)
+        np.save(self.output_dir / "labels_to_idx.npy", self.train_dataset.class_to_idx)
 
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+        )
+        self.test_loader = DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
 
-        self.BATCH_SIZE = batch_size
-
-        # 训练集的数据加载器
-        self.train_loader = DataLoader(self.train_dataset,
-                          batch_size=self.BATCH_SIZE,
-                          shuffle=True,
-                          num_workers=0
-                         )
-
-        # 测试集的数据加载器
-        self.test_loader = DataLoader(self.test_dataset,
-                         batch_size=self.BATCH_SIZE,
-                         shuffle=False,
-                         num_workers=0
-                        )
-
-        if load_method == 'load_model':
-            self.model, self.optimizer = self.load_model(model_path, self.n_class)
-        elif load_method == 'init_and_load_model':
-            self.model, self.optimizer = self.init_and_load_model(model_path, self.n_class)
-        elif load_method == 'download_and_load_model':
-            self.model, self.optimizer = self.download_and_load_model(model_path, self.n_class)
-        else:
-            raise ValueError(f'Unknown load method: {load_method}')
-
-        self.model, self.criterion, self.lr_scheduler, self.EPOCHS = self.setup_training()
-        self.best_test_accuracy = 0
-
-    def load_model(self, model_path, n_class):
-        if 'resnet34.pth' in model_path:
-            model = models.resnet34(pretrained=False)
-        elif 'resnet50.pth' in model_path:
-            model = models.resnet50(pretrained=False)
-        else:
-            print("Invalid model path")
-            return None, None
-        pretrained_dict = torch.load(model_path)
-        model_dict = model.state_dict()
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict)
-        model.fc = nn.Linear(model.fc.in_features, n_class)
-        optimizer = optim.Adam(model.parameters())
-        return model, optimizer
-
-    def init_and_load_model(self, model_path, n_class):
-        if 'resnet34.pth' in model_path:
-            # model = models.resnet34(pretrained=False)
-            model = resnet34_cbam(pretrained=False)
-        elif 'resnet50.pth' in model_path:
-            # model = models.resnet50(pretrained=False)
-            model = resnet50_cbam(pretrained=False)
-        else:
-            print("Invalid model path")
-            return None, None
-        pretrained_dict = torch.load(model_path)
-        model_dict = model.state_dict()
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict)
-        model.fc = nn.Linear(model.fc.in_features, n_class)
-        optimizer = optim.Adam(model.parameters())
-        return model, optimizer
-
-    def download_and_load_model(self, model_path, n_class):
-        if 'resnet34.pth' in model_path:
-            model = models.resnet34(pretrained=False)
-        elif 'resnet50.pth' in model_path:
-            model = models.resnet50(pretrained=False)
-        else:
-            print("Invalid model path")
-            return None, None
-        pretrained_dict = torch.load(model_path)
-        model_dict = model.state_dict()
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict)
-        model.fc = nn.Linear(model.fc.in_features, n_class)
-        optimizer = optim.Adam(model.parameters())
-        return model, optimizer
-
-    def setup_training(self):
+        self.model, self.optimizer = self._load_model()
         self.model = self.model.to(self.device)
         self.criterion = nn.CrossEntropyLoss()
-        self.lr_scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=self.step_size, gamma=self.gamma)
-        return self.model, self.criterion, self.lr_scheduler, self.epochs
+        self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer,
+            step_size=self.step_size,
+            gamma=self.gamma,
+        )
+        self.best_test_accuracy = 0.0
+        self.epoch = 0
+        self.batch_idx = 0
 
-    def apply_exif_orientation(self, image):
-        try:
-            exif = image._getexif()
-        except AttributeError:
-            exif = None
+    def _validate_paths(self):
+        if not self.dataset_dir or not self.dataset_dir.exists():
+            raise FileNotFoundError(f"数据集目录不存在: {self.dataset_dir}")
+        if not (self.dataset_dir / "train").exists():
+            raise FileNotFoundError(f"缺少训练目录: {self.dataset_dir / 'train'}")
+        if not (self.dataset_dir / "val").exists():
+            raise FileNotFoundError(f"缺少验证目录: {self.dataset_dir / 'val'}")
+        if not self.model_path or not self.model_path.exists():
+            raise FileNotFoundError(f"预训练模型不存在: {self.model_path}")
 
-        if exif is None:
-            return image
+    @staticmethod
+    def _build_transforms():
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        test_transform = transforms.Compose(
+            [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        return train_transform, test_transform
 
-        exif = {PIL.ExifTags.TAGS[k]: v for k, v in exif.items() if k in PIL.ExifTags.TAGS}
-        orientation = exif.get('Orientation', None)
+    def _create_model(self):
+        model_name = self.model_path.name.lower()
+        use_cbam = self.load_method in {"init_and_load_model", "download_and_load_model"}
 
-        if orientation == 1:
-            return image
-        elif orientation == 2:
-            return PIL.ImageOps.mirror(image)
-        elif orientation == 3:
-            return image.transpose(PIL.Image.ROTATE_180)
-        elif orientation == 4:
-            return PIL.ImageOps.flip(image)
-        elif orientation == 5:
-            return PIL.ImageOps.mirror(image.transpose(PIL.Image.ROTATE_270))
-        elif orientation == 6:
-            return image.transpose(PIL.Image.ROTATE_270)
-        elif orientation == 7:
-            return PIL.ImageOps.mirror(image.transpose(PIL.Image.ROTATE_90))
-        elif orientation == 8:
-            return image.transpose(PIL.Image.ROTATE_90)
-        else:
-            return image
+        if "resnet34" in model_name:
+            return resnet34_cbam(pretrained=False) if use_cbam else models.resnet34(weights=None)
+        if "resnet50" in model_name:
+            return resnet50_cbam(pretrained=False) if use_cbam else models.resnet50(weights=None)
+        raise ValueError(f"无法根据文件名识别模型结构: {self.model_path.name}")
+
+    def _load_model(self) -> Tuple[nn.Module, optim.Optimizer]:
+        model = self._create_model()
+        checkpoint = torch.load(self.model_path, map_location="cpu")
+        state_dict = checkpoint.state_dict() if hasattr(checkpoint, "state_dict") else checkpoint
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"模型文件格式不支持: {self.model_path}")
+
+        model_dict = model.state_dict()
+        compatible_state = {
+            key: value
+            for key, value in state_dict.items()
+            if key in model_dict and model_dict[key].shape == value.shape
+        }
+        model_dict.update(compatible_state)
+        model.load_state_dict(model_dict, strict=False)
+        model.fc = nn.Linear(model.fc.in_features, self.n_class)
+        optimizer = optim.Adam(model.parameters())
+        return model, optimizer
+
+    @staticmethod
+    def _metrics(labels, preds, prefix: str) -> Dict[str, float]:
+        return {
+            f"{prefix}_accuracy": accuracy_score(labels, preds),
+            f"{prefix}_precision": precision_score(labels, preds, average="macro", zero_division=0),
+            f"{prefix}_recall": recall_score(labels, preds, average="macro", zero_division=0),
+            f"{prefix}_f1": f1_score(labels, preds, average="macro", zero_division=0),
+        }
 
     def train_one_batch(self, images, labels):
+        self.model.train()
         images = images.to(self.device)
         labels = labels.to(self.device)
-        images = self.apply_exif_orientation(images)
+
         outputs = self.model(images)
         loss = self.criterion(outputs, labels)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        _, preds = torch.max(outputs, 1)
-        preds = preds.cpu().numpy()
-        loss = loss.detach().cpu().numpy()
-        outputs = outputs.detach().cpu().numpy()
-        labels = labels.detach().cpu().numpy()
-        log_train = {}
-        log_train['epoch'] = self.epoch
-        log_train['batch'] = self.batch_idx
-        log_train['train_loss'] = loss
-        log_train['train_accuracy'] = accuracy_score(labels, preds)
-        log_train['train_precision'] = precision_score(labels, preds, average='macro')
-        log_train['train_recall'] = recall_score(labels, preds, average='macro')
-        log_train['train_f1-score'] = f1_score(labels, preds, average='macro')
+
+        preds = torch.argmax(outputs, dim=1).detach().cpu().numpy()
+        labels_np = labels.detach().cpu().numpy()
+        log_train = {
+            "epoch": self.epoch,
+            "batch": self.batch_idx,
+            "train_loss": float(loss.detach().cpu().item()),
+        }
+        log_train.update(self._metrics(labels_np, preds, "train"))
         return log_train
 
     def evaluate_testset(self):
+        self.model.eval()
         loss_list = []
         labels_list = []
         preds_list = []
+
         with torch.no_grad():
             for images, labels in self.test_loader:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 outputs = self.model(images)
-                _, preds = torch.max(outputs, 1)
-                preds = preds.cpu().numpy()
                 loss = self.criterion(outputs, labels)
-                loss = loss.detach().cpu().numpy()
-                outputs = outputs.detach().cpu().numpy()
-                labels = labels.detach().cpu().numpy()
-                loss_list.append(loss)
-                labels_list.extend(labels)
-                preds_list.extend(preds)
-        log_test = {}
-        log_test['epoch'] = self.epoch
-        log_test['test_loss'] = np.mean(loss_list)
-        log_test['test_accuracy'] = accuracy_score(labels_list, preds_list)
-        log_test['test_precision'] = precision_score(labels_list, preds_list, average='macro')
-        log_test['test_recall'] = recall_score(labels_list, preds_list, average='macro')
-        log_test['test_f1-score'] = f1_score(labels_list, preds_list, average='macro')
+                preds = torch.argmax(outputs, dim=1)
+
+                loss_list.append(float(loss.detach().cpu().item()))
+                labels_list.extend(labels.detach().cpu().numpy())
+                preds_list.extend(preds.detach().cpu().numpy())
+
+        log_test = {
+            "epoch": self.epoch,
+            "test_loss": float(np.mean(loss_list)) if loss_list else 0.0,
+        }
+        log_test.update(self._metrics(labels_list, preds_list, "test"))
         return log_test
 
-    def train(self, callback):
-        self.epoch = 0
-        self.batch_idx = 0
-        self.best_test_accuracy = 0
+    def _save_best_checkpoint(self, accuracy: float) -> Path:
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = self.checkpoint_dir / f"best-{accuracy:.3f}.pth"
+        torch.save(self.model, checkpoint_path)
+        return checkpoint_path
 
-        # 训练日志-训练集
+    def train(self, callback=None):
+        emit = self._normalize_callback(callback)
+        emit(f"设备: {self.device}\n")
+        emit(f"训练集: {self.train_path}\n")
+        emit(f"验证集: {self.test_path}\n")
+        emit(f"类别数: {self.n_class}\n")
+
         df_train_log = pd.DataFrame()
-        log_train = {}
-        log_train['epoch'] = 0
-        log_train['batch'] = 0
-        images, labels = next(iter(self.train_loader))
-        log_train.update(self.train_one_batch(images, labels))
-        df_train_log = df_train_log._append(log_train, ignore_index=True)
-
-        # 训练日志-测试集
         df_test_log = pd.DataFrame()
-        log_test = {}
-        log_test['epoch'] = 0
-        log_test.update(self.evaluate_testset())
-        df_test_log = df_test_log._append(log_test, ignore_index=True)
 
-        # 创建wandb可视化项目
-        # wandb.init(project='phone', name=time.strftime('%m%d%H%M%S'))
-
-        if not os.path.exists('checkpoint'):
-            os.makedirs('checkpoint')
-
-        for self.epoch in range(1, self.EPOCHS + 1):
-            callback(f'Epoch {self.epoch}/{self.EPOCHS}\n')
-
-            # 训练阶段
+        for self.epoch in range(1, self.epochs + 1):
+            emit(f"\nEpoch {self.epoch}/{self.epochs}\n")
             self.model.train()
-            for images, labels in tqdm(self.train_loader):  # 获得一个 batch 的数据和标注
+
+            for images, labels in tqdm(self.train_loader, desc=f"Epoch {self.epoch}", leave=False):
                 self.batch_idx += 1
                 log_train = self.train_one_batch(images, labels)
-                df_train_log = df_train_log._append(log_train, ignore_index=True)
-                # wandb.log(log_train)
+                df_train_log = pd.concat([df_train_log, pd.DataFrame([log_train])], ignore_index=True)
 
             self.lr_scheduler.step()
-
-            # 测试阶段
-            self.model.eval()
             log_test = self.evaluate_testset()
-            df_test_log = df_test_log._append(log_test, ignore_index=True)
-            # wandb.log(log_test)
+            df_test_log = pd.concat([df_test_log, pd.DataFrame([log_test])], ignore_index=True)
+            emit(
+                "验证: loss={test_loss:.4f}, acc={test_accuracy:.4f}, "
+                "precision={test_precision:.4f}, recall={test_recall:.4f}, f1={test_f1:.4f}\n".format(**log_test)
+            )
 
-            # 保存最新的最佳模型文件
-            if log_test['test_accuracy'] > self.best_test_accuracy:
-                # 删除旧的最佳模型文件(如有)
-                old_best_checkpoint_path = f'checkpoint/best-{self.best_test_accuracy:.3f}.pth'
-                if os.path.exists(old_best_checkpoint_path):
-                    os.remove(old_best_checkpoint_path)
+            if log_test["test_accuracy"] > self.best_test_accuracy:
+                self.best_test_accuracy = log_test["test_accuracy"]
+                checkpoint_path = self._save_best_checkpoint(self.best_test_accuracy)
+                emit(f"保存最佳模型: {checkpoint_path}\n")
 
-                self.best_test_accuracy = log_test['test_accuracy']
-                new_best_checkpoint_path = f'checkpoint/best-{self.best_test_accuracy:.3f}.pth'
-                # new_best_checkpoint_path = 'checkpoint/best-{:.3f}.pth'.format(log_test['test_accuracy'])
-                torch.save(self.model, new_best_checkpoint_path)
-                callback(f'保存新的最佳模型 {new_best_checkpoint_path}\n')
+        train_log_path = self.output_dir / "train_log.csv"
+        test_log_path = self.output_dir / "val_log.csv"
+        df_train_log.to_csv(train_log_path, index=False, encoding="utf-8-sig")
+        df_test_log.to_csv(test_log_path, index=False, encoding="utf-8-sig")
+        emit(f"训练日志: {train_log_path}\n")
+        emit(f"验证日志: {test_log_path}\n")
+        emit(f"最佳验证准确率: {self.best_test_accuracy:.4f}\n")
+        return {
+            "best_test_accuracy": self.best_test_accuracy,
+            "train_log_path": str(train_log_path),
+            "test_log_path": str(test_log_path),
+        }
 
-        df_train_log.to_csv(os.path.join(self.dataset_dir, '训练日志-训练集.csv'), index=False)
-        df_test_log.to_csv(os.path.join(self.dataset_dir, '训练日志-测试集.csv'), index=False)
+    @staticmethod
+    def _normalize_callback(callback):
+        if callback is None:
+            return print
+        if hasattr(callback, "write"):
+            return callback.write
+        return callback
 
-        # 载入最佳模型作为当前模型
-        self.model = torch.load(f'checkpoint/best-{self.best_test_accuracy:.3f}.pth')
-        self.model.eval()
-        callback(str(self.evaluate_testset()) + '\n')
 
-if __name__ == '__main__':
-    # 从文件中读取参数
-    with open('parameters.json', 'r') as f:
+if __name__ == "__main__":
+    with open(BASE_DIR / "parameters.json", "r", encoding="utf-8") as f:
         parameters = json.load(f)
 
-    # 创建一个 PhoneClassifier 对象
-    classifier = PhoneClassifier(dataset_dir=parameters['dataset_dir'],
-                                 model_path=parameters['model_path'],
-                                 batch_size=parameters['batch_size'],
-                                 epochs=parameters['epochs'],
-                                 step_size=parameters['step_size'],
-                                 gamma=parameters['gamma'],
-                                 load_method=parameters['load_method'],
-                                 save=parameters['dataset_dir']
-                                 )
-    update_output = io.StringIO()
-    # 开始训练
-    classifier.train(update_output)
+    classifier = PhoneClassifier(
+        dataset_dir=parameters["dataset_dir"],
+        model_path=parameters["model_path"],
+        batch_size=parameters.get("batch_size", 16),
+        epochs=parameters.get("epochs", 10),
+        step_size=parameters.get("step_size", 5),
+        gamma=parameters.get("gamma", 0.1),
+        load_method=parameters.get("load_method", "init_and_load_model"),
+        save=parameters.get("save") or parameters["dataset_dir"],
+    )
+    classifier.train()
