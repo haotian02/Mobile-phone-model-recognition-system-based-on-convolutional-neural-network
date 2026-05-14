@@ -50,16 +50,12 @@ class CBAM(nn.Module):
 
 # ===================== CBAM包装ResNet，不改结构 =====================
 class ResNetWithCBAM(nn.Module):
-    def __init__(self, base_model, head_planes=64, tail_planes=512, num_classes=1000):
+    def __init__(self, base_model, head_planes=64, tail_planes=512):
         super(ResNetWithCBAM, self).__init__()
         self.base = base_model
 
         self.cbam_head = CBAM(head_planes)  # conv1 输出通道
         self.cbam_tail = CBAM(tail_planes)  # layer4 输出通道（resnet34 是 512，resnet50 是 2048）
-
-        # 重新定义 fc 以防用户改 num_classes
-        in_features = self.base.fc.in_features
-        self.base.fc = nn.Linear(in_features, num_classes)
 
     def forward(self, x):
         x = self.base.conv1(x)
@@ -81,10 +77,17 @@ class ResNetWithCBAM(nn.Module):
         return x
 
 # ===================== 构造函数 =====================
-def resnet34_cbam(pretrained=True, num_classes=1000):
-    base = resnet34(pretrained=pretrained)
-    return ResNetWithCBAM(base, head_planes=64, tail_planes=512, num_classes=num_classes)
+def resnet34_cbam(weights=None, num_classes=1000, pretrained=None):
+    if pretrained is not None:
+        weights = "DEFAULT" if pretrained else None
+    base = resnet34(weights=weights)
+    base.fc = nn.Linear(base.fc.in_features, num_classes)
+    return ResNetWithCBAM(base, head_planes=64, tail_planes=512)
 
-def resnet50_cbam(pretrained=True, num_classes=1000):
-    base = resnet50(pretrained=pretrained)
-    return ResNetWithCBAM(base, head_planes=64, tail_planes=2048, num_classes=num_classes)
+
+def resnet50_cbam(weights=None, num_classes=1000, pretrained=None):
+    if pretrained is not None:
+        weights = "DEFAULT" if pretrained else None
+    base = resnet50(weights=weights)
+    base.fc = nn.Linear(base.fc.in_features, num_classes)
+    return ResNetWithCBAM(base, head_planes=64, tail_planes=2048)

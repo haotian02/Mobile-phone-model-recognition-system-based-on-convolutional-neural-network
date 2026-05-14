@@ -10,9 +10,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
-import torchvision.models.resnet as torchvision_resnet
 
-import resnet_cbam
+from resnet_cbam import resnet34_cbam, resnet50_cbam
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,11 +24,14 @@ def resolve_path(path: Optional[Union[str, os.PathLike]]) -> Optional[Path]:
     return value if value.is_absolute() else BASE_DIR / value
 
 
-def register_legacy_model_classes():
-    """Expose local CBAM classes where older saved model pickles expect them."""
-    for name in ("ChannelAttention", "SpatialAttention", "CBAM", "ResNetWithCBAM"):
-        if hasattr(resnet_cbam, name):
-            setattr(torchvision_resnet, name, getattr(resnet_cbam, name))
+def _build_model(model_path: Path, num_classes: int):
+    """Build model architecture matching the checkpoint file."""
+    name = model_path.name.lower()
+    if "resnet34" in name:
+        model = resnet34_cbam(pretrained=False, num_classes=num_classes)
+    else:
+        model = resnet50_cbam(pretrained=False, num_classes=num_classes)
+    return model
 
 
 class VideoProcessor:
@@ -57,8 +59,8 @@ class VideoProcessor:
 
         self.font = self._load_font(self.font_path)
         self.idx_to_labels = np.load(self.labels_path, allow_pickle=True).item()
-        register_legacy_model_classes()
-        self.model = torch.load(self.model_path, map_location=self.device)
+
+        self.model = self._load_model()
         self.model = self.model.eval().to(self.device)
 
         self.test_transform = transforms.Compose(
@@ -74,14 +76,45 @@ class VideoProcessor:
         )
         self.stop = False
 
-    @staticmethod
-    def _load_font(font_path: Optional[Path]):
+        # EMA FPS smoothing
+        self._fps_alpha = 0.1
+        self._smooth_fps = 0.0
+
+    def _load_font(self, font_path: Optional[Path]):
         try:
             if font_path and font_path.exists():
                 return ImageFont.truetype(str(font_path), 32)
         except OSError:
             pass
         return ImageFont.load_default()
+
+    def _load_model(self):
+        """Load state_dict with fallback for legacy full-model pickle."""
+        raw = torch.load(self.model_path, map_location=self.device)
+
+        # State dict format — build model explicitly
+        if isinstance(raw, dict):
+            n_class = len(self.idx_to_labels)
+            model = _build_model(self.model_path, n_class)
+
+            model_dict = model.state_dict()
+            compatible = {
+                k: v
+                for k, v in raw.items()
+                if k in model_dict and model_dict[k].shape == v.shape
+            }
+            model.load_state_dict(compatible, strict=False)
+            return model
+
+        # Full model pickle (legacy format) — register CBAM classes for torch.load
+        import torchvision.models.resnet as tv_resnet
+
+        import resnet_cbam
+
+        for name in ("ChannelAttention", "SpatialAttention", "CBAM", "ResNetWithCBAM"):
+            if hasattr(resnet_cbam, name):
+                setattr(tv_resnet, name, getattr(resnet_cbam, name))
+        return raw
 
     def _predict_pil(self, image: Image.Image) -> List[Tuple[str, float]]:
         image = image.convert("RGB")
@@ -105,23 +138,40 @@ class VideoProcessor:
             results.append((label, float(confidence)))
         return results
 
+    def _update_fps(self, elapsed):
+        fps = 1.0 / elapsed
+        if self._smooth_fps == 0.0:
+            self._smooth_fps = fps
+        else:
+            self._smooth_fps = (
+                self._fps_alpha * fps + (1 - self._fps_alpha) * self._smooth_fps
+            )
+        return self._smooth_fps
+
     def process_frame(self, frame):
         start_time = time.time()
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
         predictions = self._predict_pil(img_pil)
 
+        # Dynamic text positioning based on frame size
+        h, w = frame.shape[:2]
+        text_x = int(w * 0.03)
+        text_y = int(h * 0.12)
+        line_height = int(h * 0.055)
+
         draw = ImageDraw.Draw(img_pil)
         for index, (label, confidence) in enumerate(predictions):
             text = f"{label:<15} {confidence * 100:>.2f}%"
-            draw.text((50, 100 + 50 * index), text, font=self.font, fill=(255, 0, 0))
+            draw.text((text_x, text_y + line_height * index), text, font=self.font, fill=(255, 0, 0))
 
         elapsed = max(time.time() - start_time, 1e-6)
+        smoothed = self._update_fps(elapsed)
         frame = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
         cv2.putText(
             frame,
-            f"FPS {int(1 / elapsed)}",
-            (50, 80),
+            f"FPS {int(smoothed)}",
+            (int(w * 0.03), int(h * 0.08)),
             cv2.FONT_HERSHEY_SIMPLEX,
             2,
             (0, 0, 255),
@@ -130,11 +180,14 @@ class VideoProcessor:
         )
         return frame
 
-    def run(self, camera_index=0):
+    def _init_camera(self, camera_index=0):
         cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             raise RuntimeError(f"无法打开摄像头: {camera_index}")
+        return cap
 
+    def run(self, camera_index=0):
+        cap = self._init_camera(camera_index)
         try:
             while cap.isOpened() and not self.stop:
                 success, frame = cap.read()
@@ -148,9 +201,7 @@ class VideoProcessor:
             cv2.destroyAllWindows()
 
     def capture_and_predict(self):
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            raise RuntimeError("无法打开摄像头")
+        cap = self._init_camera(0)
         try:
             success, frame = cap.read()
             if not success:
